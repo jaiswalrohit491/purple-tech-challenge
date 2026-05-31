@@ -160,3 +160,18 @@ async def test_metrics_avg_dwell_from_zone_exit_when_no_heartbeats(client):
     assert zones[0]["zone_id"] == "LAKME"
     assert zones[0]["visits"] == 1
     assert zones[0]["avg_dwell_ms"] == 8000.0
+
+
+async def test_metrics_reentry_not_double_counted(client):
+    """A visitor with both ENTRY and a later REENTRY is ONE unique visitor —
+    unique_visitors filters ENTRY+REENTRY but counts DISTINCT visitor_id."""
+    base = today_at(30)
+    events = [
+        make_event(event_type="ENTRY", visitor_id="V1", ts=base),
+        make_event(event_type="REENTRY", visitor_id="V1",
+                   ts=base + timedelta(minutes=10)),
+        make_event(event_type="ENTRY", visitor_id="V2", ts=base),
+    ]
+    await client.post("/events/ingest", json=events)
+    body = (await client.get(f"/stores/{DEFAULT_STORE}/metrics")).json()
+    assert body["unique_visitors"] == 2   # V1 (entry+reentry) + V2, not 3

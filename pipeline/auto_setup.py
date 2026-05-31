@@ -127,26 +127,17 @@ def write_default_layout(footage_dir: Path, out_path: Path, store_id: str = "STO
 
 # ---------- staff gallery auto-discovery ----------
 
-def _embed(model, transform, torch, pil_img) -> np.ndarray:
-    with torch.no_grad():
-        v = model(transform(pil_img).unsqueeze(0)).numpy()[0]
-    n = np.linalg.norm(v) or 1.0
-    return v / n
-
-
-def _load_resnet():
-    import torch
-    from torchvision import models, transforms
-    m = models.resnet50(weights=models.ResNet50_Weights.IMAGENET1K_V2)
-    m.fc = torch.nn.Identity()
-    m.eval()
-    t = transforms.Compose([
-        transforms.Resize(256),
-        transforms.CenterCrop(224),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-    ])
-    return m, t, torch
+def _knn_eps(X: np.ndarray, k: int = 4) -> float:
+    """Data-driven DBSCAN eps (median k-th nearest-neighbour distance) so the
+    staff-cluster discovery adapts to the active embedding backend's distance
+    scale instead of a magic number tuned for one model."""
+    n = X.shape[0]
+    if n <= k + 1:
+        return 0.30
+    D = 1.0 - X @ X.T
+    np.fill_diagonal(D, np.inf)
+    kth = np.partition(D, k, axis=1)[:, k]
+    return min(0.5, max(0.05, float(np.median(kth))))
 
 
 def _dbscan(X: np.ndarray, eps: float, min_samples: int) -> np.ndarray:
@@ -189,12 +180,13 @@ def _dbscan(X: np.ndarray, eps: float, min_samples: int) -> np.ndarray:
 
 
 def auto_staff_gallery(crops_dirs: list[Path], gallery_dir: Path,
-                       eps: float = 0.30, min_samples: int = 4,
+                       eps: float | None = None, min_samples: int = 4,
                        max_crops_in_gallery: int = 10) -> dict:
     """Discover staff via unsupervised clustering + save the largest
-    visually-coherent cluster as the staff gallery.
+    visually-coherent cluster as the staff gallery. Uses the shared person
+    embedder (OSNet re-ID, ResNet50 fallback); eps is data-driven by default.
     """
-    from PIL import Image
+    from .reid import get_embedder
 
     # Collect crop paths.
     paths = []
@@ -204,10 +196,15 @@ def auto_staff_gallery(crops_dirs: list[Path], gallery_dir: Path,
     if not paths:
         return {"error": "no crops to cluster"}
 
-    model, transform, torch = _load_resnet()
-    X = np.vstack([_embed(model, transform, torch, Image.open(p).convert("RGB"))
-                   for p in paths])
+    embedder = get_embedder()
+    if not embedder.available:
+        return {"error": "no embedding backend available (torch missing)"}
+    X = np.vstack([embedder.embed_path(p) for p in paths])
 
+    # Data-driven eps (k-distance heuristic) unless explicitly overridden, so
+    # discovery adapts to the embedding backend's distance scale.
+    if eps is None or eps <= 0:
+        eps = _knn_eps(X, k=min_samples)
     labels = _dbscan(X, eps=eps, min_samples=min_samples)
     sizes = Counter(int(l) for l in labels if l >= 0)
     if not sizes:
@@ -234,6 +231,8 @@ def auto_staff_gallery(crops_dirs: list[Path], gallery_dir: Path,
         saved.append(dst.name)
 
     return {
+        "embedding_backend": embedder.backend,
+        "eps_used": round(float(eps), 4),
         "clustered_tracks": int(len(paths)),
         "clusters_found": len(sizes),
         "cluster_sizes": dict(sizes),
@@ -258,7 +257,10 @@ def main() -> int:
     p.add_argument("--store-id", default="STORE_001")
     p.add_argument("--force", action="store_true",
                    help="Regenerate layout and gallery even if they exist.")
-    p.add_argument("--eps", type=float, default=0.30)
+    p.add_argument("--eps", type=float, default=-1.0,
+                   help="DBSCAN eps for staff-cluster discovery. Negative "
+                        "(default) = derive from data (k-distance heuristic), "
+                        "adapting to the active embedding backend.")
     p.add_argument("--min-samples", type=int, default=4)
     args = p.parse_args()
 

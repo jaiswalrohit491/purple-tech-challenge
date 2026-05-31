@@ -1,34 +1,32 @@
-"""Cluster all ByteTrack tracks across in-store cameras into N physical persons,
-then label each as staff or customer using a dual gallery (staff_gallery +
-customer_gallery).
+"""Resolve ByteTrack tracks across in-store cameras into physical persons and
+label each staff/customer — with NO operator headcount prior. The unique count
+is measured, not supplied.
 
 The pipeline:
-  1. For each `CAM_XX_trackYYY.jpg` crop in the extracted track-crops dirs,
-     compute a ResNet50 ImageNet feature (the same backbone used by
-     pipeline/staff_reid.py — no external API, no fine-tuning).
-  2. Compare each track's embedding to the staff_gallery centroid and the
-     customer_gallery centroid. The closer gallery wins → preliminary
-     staff/customer label.
-  3. Within the customer-labeled tracks, K-means with K = num_customers
-     splits them into distinct customer identities (one cluster = one
-     physical customer). Same for staff with K = num_staff.
-  4. Output a single merged JSONL where visitor_id is the canonical
-     person ID (CUSTOMER_01, STAFF_03, …) and is_staff reflects the label.
-
-This is the "merge tracks within and across cameras" pass that the brief asks
-for. It replaces tracker.py's per-camera re-entry rewrite for the in-store
-cameras because once tracks are merged by appearance, REENTRY collapses into
-"same visitor_id appears more than once" naturally.
+  1. For each `CAM_XX_trackYYY.jpg` crop, compute an appearance signature via
+     pipeline/reid.py. Default backend is a torso HSV colour histogram — the cue
+     that separates a grey shirt / tan bag / dark uniform (deep ResNet/OSNet
+     backends are opt-in via REID_BACKEND). A crop-quality gate drops occluded
+     boxes first.
+  2. Classify each track staff/customer by distance to the auto-built
+     staff_gallery (the dark-uniform group); threshold derived from gallery
+     cohesion.
+  3. Within each role, pipeline/identity.py resolves distinct people by
+     CONSTRAINED SPATIOTEMPORAL clustering on the signature: same-camera
+     temporal cannot-link (concurrent tracks = different people) + tracklet
+     stitching of adjacent fragments + topology-gated cross-camera links. The
+     identity count EMERGES — no K, no expected_* prior.
+  4. Output a single merged JSONL where visitor_id is the canonical person ID
+     (CUSTOMER_01, STAFF_03, …). One synthetic ENTRY per resolved customer feeds
+     /metrics.unique_visitors.
 
 Usage:
     python -m pipeline.cluster_and_label \\
-        --events-dir /events \\
-        --cameras CAM_01 CAM_02 CAM_05 \\
+        --events-dir /events --cameras CAM_01 CAM_02 CAM_05 \\
         --crops-dirs /events/track_crops/CAM_01 /events/track_crops/CAM_02 /events/track_crops/CAM_05 \\
-        --staff-gallery /data/staff_gallery \\
-        --customer-gallery /data/customer_gallery \\
-        --num-staff 5 --num-customers 2 \\
-        --out /events/STORE_001_merged.jsonl
+        --staff-gallery /data/staff_gallery --layout /data/store_layout.json \\
+        --same-cam-dist 0.45 --cross-cam-dist 0.45 \\
+        --out /events/ST1008_merged.jsonl
 """
 from __future__ import annotations
 
@@ -37,7 +35,6 @@ import json
 import re
 import sys
 from collections import defaultdict
-from datetime import datetime
 from pathlib import Path
 
 import numpy as np
@@ -46,122 +43,75 @@ TRACK_RE = re.compile(r"(CAM_\d+)_track(\d+)")
 VISITOR_RE = re.compile(r"(CAM_\d+)#(\d+)")
 
 
-def load_resnet():
-    import torch
-    from torchvision import models, transforms
-
-    weights = models.ResNet50_Weights.IMAGENET1K_V2
-    m = models.resnet50(weights=weights)
-    m.fc = torch.nn.Identity()
-    m.eval()
-    t = transforms.Compose([
-        transforms.Resize(256),
-        transforms.CenterCrop(224),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                             std=[0.229, 0.224, 0.225]),
-    ])
-    return m, t, torch
-
-
-def embed(path: Path, model, transform, torch) -> np.ndarray:
-    from PIL import Image
-    with Image.open(path) as img:
-        x = transform(img.convert("RGB")).unsqueeze(0)
-        with torch.no_grad():
-            v = model(x).numpy()[0]
-    n = np.linalg.norm(v) or 1.0
-    return v / n
-
-
-def gallery_centroid(gallery_dir: Path, model, transform, torch) -> np.ndarray | None:
+def gallery_embeddings(gallery_dir: Path, embedder) -> np.ndarray | None:
+    """All gallery crop embeddings, stacked. None if the dir is empty/missing."""
     if not gallery_dir.is_dir():
         return None
     embs = []
     for f in sorted(gallery_dir.iterdir()):
         if f.suffix.lower() in (".jpg", ".jpeg", ".png"):
-            embs.append(embed(f, model, transform, torch))
-    if not embs:
+            v = embedder.embed_path(f)
+            if v is not None:
+                embs.append(v)
+    return np.vstack(embs) if embs else None
+
+
+def gallery_centroid(gallery_dir: Path, embedder) -> np.ndarray | None:
+    G = gallery_embeddings(gallery_dir, embedder)
+    if G is None:
         return None
-    c = np.mean(embs, axis=0)
+    c = G.mean(axis=0)
     return c / (np.linalg.norm(c) or 1.0)
 
 
-def _dbscan_cos(X: np.ndarray, eps: float, min_samples: int) -> np.ndarray:
-    """DBSCAN on unit-norm vectors using cosine distance. Returns cluster labels."""
-    n = X.shape[0]
-    D = 1.0 - X @ X.T
-    np.fill_diagonal(D, 0.0)
-    labels = np.full(n, -1, dtype=int)
-    visited = np.zeros(n, dtype=bool)
-    cid = 0
-    def neigh(i): return np.where(D[i] <= eps)[0]
-    for i in range(n):
-        if visited[i]:
-            continue
-        visited[i] = True
-        N = neigh(i)
-        if len(N) < min_samples:
-            continue
-        labels[i] = cid
-        seeds = list(N)
-        while seeds:
-            j = seeds.pop()
-            if not visited[j]:
-                visited[j] = True
-                Nj = neigh(j)
-                if len(Nj) >= min_samples:
-                    seeds.extend(int(k) for k in Nj if not visited[k])
-            if labels[j] == -1:
-                labels[j] = cid
-        cid += 1
-    return labels
+def _crop_quality_ok(path: Path, min_aspect: float, min_short_side: int) -> bool:
+    """Crop-quality gate for appearance-based identity.
+
+    A YOLO person box for a standing/walking person is portrait-oriented
+    (taller than wide). A near-square or landscape crop means the person is
+    heavily occluded, partially out of frame, or seen top-down — its ResNet
+    embedding is unreliable and tends to land in the ambiguous distance band,
+    producing spurious identities (e.g. a top-down billing-counter blob that
+    gets labelled "customer" and fabricates a billing-queue visitor).
+
+    We require: height/width >= `min_aspect` AND the short side is at least
+    `min_short_side` px. This is a standard re-ID input filter, not a
+    per-track tuning knob — it drops the same class of degenerate crops on any
+    store.
+    """
+    from PIL import Image
+    try:
+        with Image.open(path) as img:
+            w, h = img.size
+    except Exception:
+        return False
+    if w <= 0 or h <= 0:
+        return False
+    return (h / w) >= min_aspect and min(w, h) >= min_short_side
 
 
-def kmeans_cos(X: np.ndarray, k: int, iters: int = 100, seed: int = 42):
-    """K-means with cosine distance on unit-norm vectors. Returns assignments + centroids."""
-    rng = np.random.default_rng(seed)
-    n = X.shape[0]
-    if n <= k:
-        # Each point is its own cluster.
-        return np.arange(n), X.copy()
-
-    # K-means++ initialisation.
-    centers = [X[rng.integers(0, n)]]
-    for _ in range(k - 1):
-        sims = X @ np.array(centers).T
-        d = 1.0 - sims.max(axis=1)
-        d = np.maximum(d, 1e-9)
-        probs = d / d.sum()
-        centers.append(X[rng.choice(n, p=probs)])
-    C = np.array(centers)
-
-    for _ in range(iters):
-        assign = (X @ C.T).argmax(axis=1)
-        new_C = np.zeros_like(C)
-        for i in range(k):
-            mask = assign == i
-            if mask.any():
-                m = X[mask].mean(axis=0)
-                new_C[i] = m / (np.linalg.norm(m) or 1.0)
-            else:
-                new_C[i] = C[i]
-        if np.allclose(C, new_C, atol=1e-6):
-            break
-        C = new_C
-    return assign, C
-
-
-def parse_crops(crops_dirs: list[Path]) -> list[tuple[str, int, Path]]:
-    out = []
+def parse_crops(
+    crops_dirs: list[Path],
+    min_aspect: float = 1.3,
+    min_short_side: int = 60,
+) -> tuple[list[tuple[str, int, Path]], list[str]]:
+    """Return (kept tracks, dropped crop names). Tracks whose representative
+    crop fails the quality gate are excluded from clustering entirely; their
+    events fall through as unmatched downstream."""
+    out: list[tuple[str, int, Path]] = []
+    dropped: list[str] = []
     for d in crops_dirs:
         if not d.is_dir():
             continue
         for f in sorted(d.glob("*.jpg")):
             m = TRACK_RE.match(f.name)
-            if m:
-                out.append((m.group(1), int(m.group(2)), f))
-    return out
+            if not m:
+                continue
+            if not _crop_quality_ok(f, min_aspect, min_short_side):
+                dropped.append(f.name)
+                continue
+            out.append((m.group(1), int(m.group(2)), f))
+    return out, dropped
 
 
 def main() -> int:
@@ -171,33 +121,67 @@ def main() -> int:
     p.add_argument("--crops-dirs", nargs="+", type=Path, required=True)
     p.add_argument("--staff-gallery", type=Path, default=Path("/data/staff_gallery"))
     p.add_argument("--customer-gallery", type=Path, default=Path("/data/customer_gallery"))
-    p.add_argument("--staff-threshold", type=float, default=0.45,
+    p.add_argument("--staff-threshold", type=float, default=-1.0,
                    help="Cosine distance threshold against the staff gallery. "
-                        "Used only when --customer-gallery is missing.")
-    p.add_argument("--num-staff", type=int, default=0,
-                   help="If 0, infer the number of staff identities via DBSCAN "
-                        "on the staff-classified tracks (auto-K).")
-    p.add_argument("--num-customers", type=int, default=0,
-                   help="If 0, infer customer identity count via DBSCAN (auto-K).")
+                        "Negative (default) = derive it data-drivenly from the "
+                        "gallery's own cohesion, so it adapts to the active "
+                        "embedding backend. Used only when --customer-gallery is missing.")
+    p.add_argument("--layout", type=Path, default=None,
+                   help="Layout JSON; read for optional camera_topology (store geometry).")
+    p.add_argument("--same-cam-dist", type=float, default=0.30,
+                   help="Cosine-distance threshold to stitch adjacent same-camera "
+                        "tracklets (re-ID matching param, not a count).")
+    p.add_argument("--cross-cam-dist", type=float, default=0.25,
+                   help="Cosine-distance threshold to link tracks across cameras.")
+    p.add_argument("--stitch-gap", type=float, default=20.0,
+                   help="Max seconds between same-camera tracklets to stitch them.")
+    p.add_argument("--cross-window", type=float, default=45.0,
+                   help="Max seconds between tracks on different cameras to link them.")
+    p.add_argument("--reentry-gap", type=float, default=60.0,
+                   help="If a resolved customer is absent from all cameras longer "
+                        "than this many seconds and returns, emit a REENTRY event "
+                        "(same visitor_id, no double-count).")
     p.add_argument("--out", type=Path, required=True)
     p.add_argument("--store-id", default="STORE_001")
+    p.add_argument("--min-crop-aspect", type=float, default=1.3,
+                   help="Crop-quality gate: drop tracks whose representative "
+                        "crop has height/width below this (occluded / partial / "
+                        "top-down boxes). Set 0 to disable.")
+    p.add_argument("--min-crop-short-side", type=int, default=60,
+                   help="Crop-quality gate: drop tracks whose crop short side "
+                        "is below this many pixels.")
     args = p.parse_args()
 
-    print("loading ResNet50…", file=sys.stderr)
-    model, transform, torch = load_resnet()
+    from .reid import get_embedder
+    embedder = get_embedder()
+    if not embedder.available:
+        print("no embedding backend available (torch missing)", file=sys.stderr)
+        return 1
+    print(f"embedding backend: {embedder.backend} (dim={embedder.dim})", file=sys.stderr)
 
-    tracks = parse_crops(args.crops_dirs)
+    tracks, dropped_crops = parse_crops(
+        args.crops_dirs,
+        min_aspect=args.min_crop_aspect,
+        min_short_side=args.min_crop_short_side,
+    )
+    if dropped_crops:
+        print(f"crop-quality gate dropped {len(dropped_crops)} low-quality "
+              f"tracks (aspect<{args.min_crop_aspect}, short-side<"
+              f"{args.min_crop_short_side}px): {', '.join(sorted(dropped_crops))}",
+              file=sys.stderr)
     if not tracks:
         print("no crops found", file=sys.stderr)
         return 1
     print(f"embedding {len(tracks)} tracks…", file=sys.stderr)
-    X = np.vstack([embed(t[2], model, transform, torch) for t in tracks])
+    X = np.vstack([embedder.embed_path(t[2]) for t in tracks])
 
-    staff_c = gallery_centroid(args.staff_gallery, model, transform, torch)
-    cust_c = gallery_centroid(args.customer_gallery, model, transform, torch)
-    if staff_c is None:
+    staff_G = gallery_embeddings(args.staff_gallery, embedder)
+    cust_c = gallery_centroid(args.customer_gallery, embedder)
+    if staff_G is None:
         print("staff gallery empty — cannot label", file=sys.stderr)
         return 1
+    staff_c = staff_G.mean(axis=0)
+    staff_c = staff_c / (np.linalg.norm(staff_c) or 1.0)
     has_customer_gallery = cust_c is not None
 
     # Distances to gallery (1 - cosine).
@@ -206,51 +190,105 @@ def main() -> int:
         d_cust = 1.0 - X @ cust_c
         is_customer_track = d_cust < d_staff
     else:
-        # No customer gallery — pure-data, uniform-only classification:
-        # tracks within `staff_threshold` of the auto-built staff gallery are
-        # staff; everything else is a customer. The threshold defaults to 0.45,
-        # picked from the bimodal distance histogram in the operator's data.
-        is_customer_track = d_staff > args.staff_threshold
+        # No customer gallery — pure-data, uniform-only classification: tracks
+        # within `staff_threshold` of the auto-built staff gallery are staff;
+        # everything else is a customer. The threshold is derived from the
+        # gallery's OWN cohesion (mean + 2·std of gallery-to-centroid distance)
+        # so it adapts to the active embedding backend rather than being a
+        # magic number tuned for one model. An explicit --staff-threshold >= 0
+        # overrides it.
+        if args.staff_threshold >= 0:
+            staff_threshold = args.staff_threshold
+        else:
+            gd = 1.0 - staff_G @ staff_c
+            staff_threshold = float(gd.mean() + 2.0 * gd.std()) if len(gd) > 1 else 0.3
+        print(f"staff distance threshold: {staff_threshold:.3f} "
+              f"({'explicit' if args.staff_threshold >= 0 else 'auto from gallery cohesion'})",
+              file=sys.stderr)
+        is_customer_track = d_staff > staff_threshold
 
     customer_idxs = np.where(is_customer_track)[0]
     staff_idxs = np.where(~is_customer_track)[0]
     print(f"preliminary: {len(staff_idxs)} staff tracks, {len(customer_idxs)} customer tracks",
           file=sys.stderr)
 
-    # Sub-cluster each role into physical persons. K is either operator-provided
-    # (--num-staff/--num-customers > 0) or inferred via DBSCAN (auto-K mode).
-    canonical_per_track: dict[int, tuple[str, bool]] = {}
+    # ---- Resolve physical identities per role via spatiotemporal constrained
+    # clustering (pipeline/identity.py). The count EMERGES — no operator K, no
+    # expected_* prior. Same-camera temporal overlap is a hard cannot-link;
+    # within-camera fragments are stitched; cross-camera links are topology- and
+    # time-gated. See identity.py for the full rationale.
+    from . import identity as idmod
 
-    def _subcluster(idxs: np.ndarray, target_k: int, role: str, is_staff: bool) -> int:
+    # Per-track time spans (epoch seconds) + first/last zone, from the
+    # per-camera event streams. Zones feed the movement-continuity bonus.
+    span_map: dict[tuple[str, int], tuple[float, float]] = {}
+    zone_map: dict[tuple[str, int], dict] = {}
+    for cam in args.cameras:
+        ef = args.events_dir / f"{args.store_id}_{cam}.jsonl"
+        if not ef.exists():
+            continue
+        with ef.open() as f:
+            for line in f:
+                if not line.strip():
+                    continue
+                e = json.loads(line)
+                mm = VISITOR_RE.match(e.get("visitor_id", ""))
+                if not mm:
+                    continue
+                k = (mm.group(1), int(mm.group(2)))
+                ts = idmod.parse_ts(e["timestamp"])
+                lo, hi = span_map.get(k, (ts, ts))
+                span_map[k] = (min(lo, ts), max(hi, ts))
+                z = e.get("zone_id")
+                zi = zone_map.get(k)
+                if zi is None:
+                    zone_map[k] = {"fts": ts, "fz": z, "lts": ts, "lz": z}
+                else:
+                    if ts <= zi["fts"]:
+                        zi["fts"], zi["fz"] = ts, z
+                    if ts >= zi["lts"]:
+                        zi["lts"], zi["lz"] = ts, z
+
+    # Camera topology (physical reachability) from the layout; fully-connected
+    # default if not declared. This is store geometry, not a count.
+    layout_topo = None
+    if args.layout and args.layout.exists():
+        try:
+            ld = json.loads(args.layout.read_text())
+            stores = ld.get("stores", ld if isinstance(ld, list) else [])
+            for s in stores:
+                if s.get("store_id") == args.store_id or len(stores) == 1:
+                    layout_topo = s.get("camera_topology")
+                    break
+        except Exception:
+            layout_topo = None
+    topo = idmod.build_topology([t[0] for t in tracks], layout_topo)
+
+    canonical_per_track: dict[int, tuple[str, bool]] = {}
+    resolve_stats: dict[str, dict] = {}
+
+    def _resolve(idxs: np.ndarray, role: str, is_staff: bool) -> int:
         if not len(idxs):
             return 0
-        Xx = X[idxs]
-        if target_k > 0:
-            assign, _ = kmeans_cos(Xx, target_k)
-            k_used = target_k
-        else:
-            # Auto-K via DBSCAN on cosine distance. Tighter eps than the
-            # staff-gallery threshold because within a role we're separating
-            # identities, not classes.
-            assign = _dbscan_cos(Xx, eps=0.20, min_samples=2)
-            # Re-number to start from 0 contiguously (DBSCAN may emit -1=noise).
-            unique = sorted(set(int(a) for a in assign if a >= 0))
-            mapping = {old: new for new, old in enumerate(unique)}
-            next_id = len(unique)
-            for k, a in enumerate(assign):
-                a = int(a)
-                if a < 0:
-                    assign[k] = next_id  # each noise point = its own identity
-                    next_id += 1
-                else:
-                    assign[k] = mapping[a]
-            k_used = next_id
-        for i, c in zip(idxs, assign):
-            canonical_per_track[int(i)] = (f"{role}_{int(c) + 1:02d}", is_staff)
-        return k_used
+        cams = [tracks[i][0] for i in idxs]
+        spans = [span_map.get((tracks[i][0], tracks[i][1]), (0.0, 0.0)) for i in idxs]
+        zlist = []
+        for i in idxs:
+            zi = zone_map.get((tracks[i][0], tracks[i][1]))
+            zlist.append((zi["fz"], zi["lz"]) if zi else (None, None))
+        labels, stats = idmod.resolve(
+            cams, spans, X[idxs], topology=topo, zones=zlist,
+            same_cam_dist=args.same_cam_dist, cross_cam_dist=args.cross_cam_dist,
+            stitch_gap_s=args.stitch_gap, cross_window_s=args.cross_window,
+        )
+        for i, lab in zip(idxs, labels):
+            canonical_per_track[int(i)] = (f"{role}_{int(lab) + 1:02d}", is_staff)
+        stats["peak_occupancy"] = idmod.peak_occupancy(spans, cams)
+        resolve_stats[role] = stats
+        return stats["n_identities"]
 
-    n_staff_clusters = _subcluster(staff_idxs, args.num_staff, "STAFF", True)
-    n_customer_clusters = _subcluster(customer_idxs, args.num_customers, "CUSTOMER", False)
+    _resolve(staff_idxs, "STAFF", True)
+    _resolve(customer_idxs, "CUSTOMER", False)
 
     # Map (camera, track_id) -> canonical.
     track_map: dict[tuple[str, int], tuple[str, bool]] = {}
@@ -285,9 +323,10 @@ def main() -> int:
                 e["metadata"] = meta
                 out_events.append(e)
 
-    # Synthesise one ENTRY event per canonical person at their earliest
+    # Synthesise one ENTRY event per RESOLVED customer identity at their earliest
     # appearance, so /metrics.unique_visitors (which filters event_type in
-    # ENTRY/REENTRY) returns the right customer count without a SQL change.
+    # ENTRY/REENTRY) returns the measured customer count without a SQL change.
+    # The count is whatever the spatiotemporal resolver found — not a prior.
     earliest: dict[str, dict] = {}
     for e in out_events:
         canon = e["visitor_id"]
@@ -315,6 +354,38 @@ def main() -> int:
             },
         })
     out_events.extend(entry_events)
+
+    # Re-entry: a resolved customer who disappears from all cameras for longer
+    # than --reentry-gap and then reappears gets a REENTRY event at the moment
+    # of return, REUSING the same visitor_id (so the funnel / unique_visitors do
+    # not double-count — REENTRY and ENTRY both map to one person). This is the
+    # measured analogue of "left the floor and came back".
+    from . import identity as _idmod
+    reentry_events = []
+    by_canon: dict[str, list[dict]] = defaultdict(list)
+    for e in out_events:
+        if e["event_type"] in ("ENTRY", "REENTRY"):
+            continue
+        if not e.get("is_staff"):
+            by_canon[e["visitor_id"]].append(e)
+    for canon, evs in by_canon.items():
+        evs = sorted(evs, key=lambda e: e["timestamp"])
+        prev = None
+        for e in evs:
+            ts = _idmod.parse_ts(e["timestamp"])
+            if prev is not None and (ts - prev) > args.reentry_gap:
+                reentry_events.append({
+                    "event_id": str(_uuid.uuid4()),
+                    "store_id": e["store_id"], "camera_id": e["camera_id"],
+                    "visitor_id": canon, "event_type": "REENTRY",
+                    "timestamp": e["timestamp"], "zone_id": None, "dwell_ms": 0,
+                    "is_staff": False, "confidence": 0.9,
+                    "metadata": {"queue_depth": None, "sku_zone": None,
+                                 "session_seq": 0, "synthetic": True,
+                                 "reason": f"reappeared after >{int(args.reentry_gap)}s absence"},
+                })
+            prev = ts
+    out_events.extend(reentry_events)
     out_events.sort(key=lambda e: e["timestamp"])
 
     args.out.parent.mkdir(parents=True, exist_ok=True)
@@ -329,15 +400,22 @@ def main() -> int:
     customers = sorted([c for c, r in canon_role.items() if r == "CUSTOMER"])
     staff = sorted([c for c, r in canon_role.items() if r == "STAFF"])
 
+    cust_occ = resolve_stats.get("CUSTOMER", {}).get("peak_occupancy", 0)
+    staff_occ = resolve_stats.get("STAFF", {}).get("peak_occupancy", 0)
     print(json.dumps({
         "tracks_in": len(tracks),
+        "crops_dropped_low_quality": len(dropped_crops),
         "unmatched_events": unmatched,
         "events_out": len(out_events),
         "synthetic_entries": len(entry_events),
-        "customers": customers,
-        "staff": staff,
+        "reentry_events": len(reentry_events),
         "n_customers": len(customers),
         "n_staff": len(staff),
+        "peak_customer_occupancy": cust_occ,
+        "peak_staff_occupancy": staff_occ,
+        "resolve_stats": resolve_stats,
+        "customers": customers,
+        "staff": staff,
         "out": str(args.out),
     }, indent=2))
     return 0

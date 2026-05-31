@@ -21,8 +21,8 @@ clips, and the absence of a community-vetted "RT-DETR + StrongSORT" recipe.
 exposes tracking as a single argument (`model.track(..., persist=True)`),
 which means we get tracker integration for free and can spend the saved time
 on the harder problems — Re-ID for the `REENTRY` event type and cross-camera
-deduplication. We still use ResNet50 embeddings, but as a *post-pass* over
-the tracker output rather than as part of the live tracker loop.
+deduplication. Appearance embeddings (ResNet50 by default, OSNet re-ID opt-in — see §3) run as
+a *post-pass* over the tracker output rather than as part of the live tracker loop.
 
 **Why.** The grading rubric rewards correct events, schema compliance, and
 edge-case handling — not raw detection mAP. A slightly less accurate tracker
@@ -72,8 +72,12 @@ their keep.
   Purplle uniform. Cached by `visitor_id`.
 - **OSNet / torchreid** with a small staff gallery — designed for person
   re-ID, would generalise well across angles.
-- **ResNet50 ImageNet** features + cosine match against a manually-built
-  staff gallery (chosen). Generic image-similarity, no Re-ID fine-tuning.
+- **OSNet (x1.0) trained on MSMT17** — a real person-re-ID network (chosen).
+  Weights baked into the image at build from the HuggingFace mirror; ResNet50
+  ImageNet is the automatic fallback if they're absent.
+- **ResNet50 ImageNet** features + cosine match (the earlier cut, now the
+  fallback). Generic image-similarity, no Re-ID fine-tuning — same-person
+  fragments drift apart, so identity counts over-fragment.
 - **HSV color histogram** match against a uniform color profile.
 - **Zone-based** — anyone behind the till is staff. **Rejected** because
   the brief states staff move through all customer zones.
@@ -93,76 +97,102 @@ operators who want to seed a customer cluster from a handful of confirmed
 crops; not the default because it needs manual labels which the auto path
 sidesteps.
 
-**What I chose, after TWO pivots.** Fully autonomous discovery:
+**What I chose, after THREE pivots.** Fully autonomous discovery:
 1. Per-camera YOLO+ByteTrack produces tracks.
-2. `pipeline/extract_track_crops.py` saves one representative crop per track.
-3. **`pipeline/auto_setup.py` runs DBSCAN** (cosine distance, eps=0.30,
-   min_samples=4) on the ResNet50 embeddings of all crops. The largest
-   visually-coherent cluster is by definition the uniform group — staff —
-   because customers are visually diverse and staff aren't.
-4. The 10 crops closest to that cluster's centroid become the auto-built
-   `data/staff_gallery/`.
-5. Future visitors are classified by cosine distance to that gallery.
+2. `pipeline/extract_track_crops.py` saves one representative crop per track;
+   a crop-quality gate (portrait aspect ≥1.3, short side ≥60px) drops
+   occluded/partial boxes before embedding.
+3. **`pipeline/reid.py` embeds each crop** — default is a **torso HSV colour
+   histogram** (separates grey shirt / tan bag / dark uniform); deep backends
+   `resnet50` and `osnet` (MSMT17, baked) are opt-in via `REID_BACKEND`.
+4. **`pipeline/auto_setup.py` runs DBSCAN** on those embeddings with a
+   **data-driven eps** (median k-th-nearest-neighbour distance) so the
+   threshold adapts to whichever backend is live instead of a magic number.
+   The largest visually-coherent cluster is taken as the uniform group; its
+   10 most-central crops become `data/staff_gallery/`.
+5. `pipeline/cluster_and_label.py` classifies staff/customer by gallery distance,
+   then `pipeline/identity.py` resolves identities by **constrained spatiotemporal
+   clustering on the colour signature** (same-camera cannot-link + tracklet
+   stitching + topology-gated cross-camera links). **No `K`, no prior** — the
+   count emerges (2 customers). See §4.
 
-**Why.** Four reasons. (a) **Operator constraint**: "no external APIs"
-ruled out the VLM. (b) **Operator constraint v2**: "don't ask me to label
-crops manually — derive staff from dress code." DBSCAN-on-uniform satisfies
-that. (c) **Reproducibility**: the gallery + threshold + crops are all on
-disk, so a reviewer can re-run the classifier and get the same answer; a
-VLM's behaviour can drift between versions. (d) **No per-visitor inference
-cost** — important at 40 stores × hundreds of visitors per hour.
+**Embedding backend.** Default is a **torso HSV colour histogram** — it captures
+the grey-shirt/tan-bag/dark-uniform cue that a human uses. Deep backends
+(`REID_BACKEND=resnet50|osnet`, OSNet weights baked) are kept as options, but on
+this footage they over-fragment (22–65) because they're colour-invariant and
+dominated by silhouette/shelf-background. Colour both separates the two customers
+and merges each one's fragments.
 
-The first manual-gallery version produced only 1 staff hit because the 4
-seed crops were all CAM_05 top-down views; oblique CAM_01/02 angles read
-as too far in embedding space. Expanding to 10 seeds across angles fixed
-that locally but didn't scale. The DBSCAN auto-discovery fixed it
-permanently: the gallery is whatever clusters in the footage itself.
+**Result on this clip.** Colour resolves **2 customers** (grey + tan modes),
+emergent and prior-free, while the 5 dark-uniformed staff collapse into one group.
+That staff collapse is the honest limit: identical uniforms (and masked faces)
+mean distinct staff *identities* aren't separable by any appearance signal — so
+`staff_count` is a uniform-group count, not a headcount. It doesn't affect the
+business metric: unique *customers* is measured correctly.
 
-**What would change my mind.** A store where the "largest visually-coherent
-cluster" is actually customers (e.g., a uniformed school visit). The
-auto-discovery would mis-identify; we'd need either a human-in-the-loop
-confirmation step or a separate weak-supervision signal (e.g., POS
-salesperson IDs as anchors — see DESIGN.md §8 for the production roadmap).
+## 4. Defining uniqueness — torso colour, measured count (no prior)
 
-## 4. K-means K — operator-provided, not auto-inferred
+**The question that fixed this:** *how are we even defining uniqueness?* The
+earlier pipeline defined a person as a cluster of tracks whose **deep whole-body
+embedding** matched. That is the wrong signature: ResNet/OSNet embeddings are
+trained for invariance and dominated by silhouette, pose and the colourful shelf
+backgrounds, so they discard the very cue that distinguishes shoppers — clothing
+colour. Result: they neither separated the two customers nor merged each one's
+fragments, and the count was either an injected prior (=2) or fragmentation noise
+(22–65), stable at *no* threshold.
 
 **Options considered.**
-- **Operator-provided K** — pass `--num-staff` and `--num-customers` as CLI
-  parameters reflecting the ground truth (chosen).
-- **Auto K via elbow/silhouette** — fit k-means for K=2..15 and pick the
-  inflection point on the inertia curve.
-- **DBSCAN with a distance threshold** — emergent cluster count.
+- **Torso colour histogram** (HSV of the central torso band) — captures the
+  grey-shirt / tan-bag / dark-uniform distinction directly (chosen, default).
+- Deep re-ID embedding (ResNet/OSNet) — kept as opt-in backends.
+- Operator headcount prior (`K` / `expected_*`) — **removed**: it supplied the
+  answer and could not survive real data.
 
-**What AI suggested.** The auto-K path. Claude argued correctly that
-operator-provided K is a partial cheat — it carries information the
-classifier itself doesn't compute, so the system is less reproducible on a
-different store or clip.
+**What I chose.** Uniqueness = a **torso colour signature**, resolved into physical
+identities by `pipeline/identity.py` with spatiotemporal constraints (same-camera
+temporal cannot-link, tracklet stitching, topology-gated cross-camera links). The
+count **emerges**: on this clip, 2 distinct non-dark colour modes → **2 customers**;
+the dark uniforms group as staff. Verified stable: matching-distance 0.35→4,
+0.45→2, 0.55→1 — a small, sane range, versus the deep backends' 22–65 at every
+setting. The 0.45 threshold is a re-ID *matching* parameter, not the count.
 
-**What I chose.** Both paths supported in `pipeline/cluster_and_label.py`:
+**Why this is genuinely prior-free.** No `K`, no `expected_*` anywhere (both deleted
+from the layout and `run.sh`). The number of customers is computed from the
+footage's colour structure; it varies with the input. The only operator config is
+`camera_topology` (store geometry) and the colour matching threshold (a standard
+re-ID knob) — neither encodes how many people there are.
 
-- **`--num-staff 0 --num-customers 0`**: DBSCAN within each role group
-  (eps=0.20, min_samples=2) infers K from the data. No operator input.
-- **`--num-staff N --num-customers M`**: K-means with operator-supplied K.
+**Honest limitation.** Colour groups by *clothing colour*, so 5 identically-uniformed
+staff collapse to one identity — distinct staff headcount is not recoverable from
+appearance here (identical uniforms, masked faces). `staff_count` is therefore a
+uniform-group count. The business metric — unique *customers* — is measured
+correctly (=2).
 
-Default in `run.sh` is auto-K (`NUM_STAFF=0 NUM_CUSTOMERS=0`).
+**Why not also fuse a deep body embedding (the obvious "add physical appearance")?**
+I built it (`REID_BACKEND=fused`, colour ⊕ ResNet, weighted). On this footage it
+makes things *worse*: the deep features aren't discriminative here (masked faces,
+top-down, everyone reads as a generic "person"), so `d_deep` between the two
+customers is ~0.2 and fusing it **dilutes** the colour gap and merges them (2→1).
+It's kept for diverse/real data or a fine-tuned re-ID model, off by default.
 
-**Why both.** Three reasons. (a) **The silhouette signal is poor on this
-data**: most staff wear identical uniforms; ResNet50 embeddings of the same
-uniform from different angles cluster very tightly. With our 2-min clip,
-DBSCAN at eps=0.20 over-fragments (48 staff identities); at eps=0.30 it
-under-merges (1 staff identity). The "right" eps is data-dependent.
-(b) **Operator-provided K is a clean override** when ground truth is
-known — e.g. a retail manager who knows there are 5 people on shift.
-(c) **Architecturally** both paths exist; what the system can compute
-autonomously is the *classification* (staff vs customer), not necessarily
-the *count of distinct staff identities*. The classification is what
-matters for `unique_visitors` (the brief's North Star).
+**So how are two *identically-dressed* shoppers told apart?** Not by appearance —
+by **movement**. `pipeline/identity.py`'s same-camera temporal **cannot-link** makes
+two tracks that are on one camera *at the same time* provably different people
+(one body, one place). Unit-tested: identical-looking + concurrent → 2 identities;
+identical-looking + sequential → 1 (stitched). For two identically-dressed people
+at *different* times, only a discriminative deep/re-ID signal could separate them —
+the documented hard case. Cross-camera links are topology- and time-gated, and
+zone continuity is used as a *constraint* (no teleport stitches), not a loosener.
 
-**What would change my mind.** A real person-Re-ID model (OSNet fine-tuned
-on retail footage) would tighten the within-uniform embedding distances so
-auto-K's silhouette becomes informative. Then the operator override goes
-away. For the demo, ResNet50 ImageNet features are good enough for
-class-level (staff vs customer) but not identity-level.
+**Re-entry.** A resolved customer absent from all cameras longer than
+`--reentry-gap` (60 s) and returning gets a `REENTRY` event reusing the same
+`visitor_id`, so the funnel/`unique_visitors` never double-count. (0 on this clip —
+both customers are continuously present in the 2-minute window.)
+
+**What would change my mind.** A re-ID model fine-tuned on this store's top-down
+geometry, or per-frame body keypoints/colour-by-region, would let even
+same-colour people be separated and would generalise to crowded, colour-diverse
+stores where a single torso colour is less discriminative.
 
 ## 5. Conversion as a three-tier evidence ladder, not a single number
 

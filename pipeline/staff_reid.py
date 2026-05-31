@@ -50,7 +50,7 @@ class GalleryStaffClassifier:
         self._lock = Lock()
         self._cache: dict[str, StaffVerdict] = {}
         self._model = None
-        self._transform = None
+        self._embedder = None
         self._gallery_embeddings: np.ndarray | None = None
         self._gallery_paths: list[Path] = []
         self._loaded = False
@@ -60,27 +60,15 @@ class GalleryStaffClassifier:
             return
         self._loaded = True  # idempotent guard even on failure
 
-        try:
-            import torch
-            from torchvision import models, transforms
-        except ImportError:
-            return
+        # Use the shared person embedder (OSNet re-ID, ResNet50 fallback) so
+        # detection-time staff tagging uses the SAME vectors as the downstream
+        # cross-camera merge in cluster_and_label.py.
+        from .reid import get_embedder
 
-        # Load ResNet50 ImageNet weights once. Drop the classifier head so the
-        # forward pass returns the 2048-dim avg-pool vector.
-        weights = models.ResNet50_Weights.IMAGENET1K_V2
-        backbone = models.resnet50(weights=weights)
-        backbone.fc = torch.nn.Identity()
-        backbone.eval()
-        self._model = backbone
-        self._torch = torch
-        self._transform = transforms.Compose([
-            transforms.Resize(256),
-            transforms.CenterCrop(224),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                                 std=[0.229, 0.224, 0.225]),
-        ])
+        self._embedder = get_embedder()
+        if not self._embedder.available:
+            return
+        self._model = object()  # sentinel: backend is live
 
         if not self.gallery_dir.is_dir():
             return
@@ -89,25 +77,20 @@ class GalleryStaffClassifier:
         if not paths:
             return
 
-        from PIL import Image
         embeddings = []
         for p in paths:
             try:
-                img = Image.open(p).convert("RGB")
-                emb = self._embed_pil(img)
-                embeddings.append(emb)
-                self._gallery_paths.append(p)
+                emb = self._embedder.embed_path(p)
+                if emb is not None:
+                    embeddings.append(emb)
+                    self._gallery_paths.append(p)
             except Exception as e:
                 print(f"staff_reid: skipping gallery image {p.name}: {e}")
         if embeddings:
             self._gallery_embeddings = np.vstack(embeddings)
 
     def _embed_pil(self, pil_img) -> np.ndarray:
-        with self._torch.no_grad():
-            x = self._transform(pil_img).unsqueeze(0)
-            feat = self._model(x).numpy()[0]
-        norm = np.linalg.norm(feat) or 1.0
-        return feat / norm
+        return self._embedder.embed_pil(pil_img)
 
     def classify(self, visitor_id: str, crop_jpeg: bytes | None) -> StaffVerdict:
         with self._lock:

@@ -29,8 +29,6 @@ API_URL="${API_URL:-http://localhost:8000}"
 LAYOUT="${LAYOUT:-$DATA_DIR/store_layout.json}"
 POS="${POS:-$DATA_DIR/Brigade_Bangalore_10_April_26 (1)bc6219c.csv}"
 STAFF_GALLERY_DIR="${STAFF_GALLERY_DIR:-$DATA_DIR/staff_gallery}"
-NUM_STAFF="${NUM_STAFF:-0}"
-NUM_CUSTOMERS="${NUM_CUSTOMERS:-0}"
 SHIFT="${SHIFT:-0}"
 
 mkdir -p "$EVENTS_DIR"
@@ -81,6 +79,10 @@ done
 STORE_ID=$(python3 -c "
 import json; print(json.load(open('$LAYOUT'))['stores'][0]['store_id'])")
 
+# Unique-person count is MEASURED by the spatiotemporal identity engine
+# (pipeline/identity.py) — no operator headcount prior, no K. Camera geometry
+# (`camera_topology`) is read from the layout to gate cross-camera links.
+
 # ---------- 3. extract crops for in-store cameras ----------
 for CAM in CAM_01 CAM_02 CAM_05; do
     CROPS_DIR="$EVENTS_DIR/track_crops/$CAM"
@@ -109,10 +111,11 @@ python3 -m pipeline.cluster_and_label \
     --crops-dirs "$EVENTS_DIR/track_crops/CAM_01" "$EVENTS_DIR/track_crops/CAM_02" "$EVENTS_DIR/track_crops/CAM_05" \
     --staff-gallery "$STAFF_GALLERY_DIR" \
     --customer-gallery "$DATA_DIR/nonexistent_customer_gallery" \
-    --staff-threshold 0.45 \
-    --num-staff "$NUM_STAFF" --num-customers "$NUM_CUSTOMERS" \
+    --layout "$LAYOUT" \
+    --same-cam-dist "${SAME_CAM_DIST:-0.45}" --cross-cam-dist "${CROSS_CAM_DIST:-0.45}" \
+    --stitch-gap "${STITCH_GAP:-60}" --cross-window "${CROSS_WINDOW:-90}" \
     --store-id "$STORE_ID" \
-    --out "$EVENTS_DIR/${STORE_ID}_merged.jsonl" 2>&1 | tail -10
+    --out "$EVENTS_DIR/${STORE_ID}_merged.jsonl" 2>&1 | tail -16
 
 MERGED="$EVENTS_DIR/${STORE_ID}_merged.jsonl"
 

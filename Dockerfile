@@ -40,6 +40,23 @@ RUN pip install --upgrade pip \
     && pip uninstall -y opencv-python opencv-python-headless \
     && pip install --no-cache-dir "opencv-python-headless>=4.10"
 
+# ByteTrack's association solver, in its own cheap layer so it doesn't invalidate
+# the (expensive) torch/ultralytics layer above. Without it Ultralytics
+# auto-installs lap at first detection — slow, and a hard failure when offline.
+RUN pip install "lap>=0.5.12"
+
+# Bake the OSNet person-re-ID weights (trained on MSMT17) into the image from
+# the HuggingFace mirror, so identity embedding needs NO runtime network access.
+# Non-fatal: if the download fails at build time the file is absent and
+# pipeline/reid.py automatically falls back to ResNet50 ImageNet features, so
+# `docker compose up` / the acceptance gate never break on this step.
+RUN mkdir -p /opt/models \
+    && curl -fsSL --retry 3 --retry-delay 2 \
+        "https://huggingface.co/kaiyangzhou/osnet/resolve/main/osnet_x1_0_msmt17_combineall_256x128_amsgrad_ep150_stp60_lr0.0015_b64_fb10_softmax_labelsmooth_flip_jitter.pth" \
+        -o /opt/models/osnet_x1_0_msmt17.pth \
+    && python -c "import os; assert os.path.getsize('/opt/models/osnet_x1_0_msmt17.pth') > 1_000_000" \
+    || (echo "WARNING: re-ID weight download failed; runtime falls back to ResNet50" && rm -f /opt/models/osnet_x1_0_msmt17.pth)
+
 COPY app ./app
 COPY pipeline ./pipeline
 COPY dashboard ./dashboard

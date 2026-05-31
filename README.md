@@ -25,12 +25,21 @@ Drop it in production where events arrive in real-time.
    (one whole-frame zone per camera, sensible roles by camera number).
 2. Per-camera YOLO + ByteTrack detection emits raw JSONL events.
 3. `extract_track_crops.py` saves one representative crop per ByteTrack track.
-4. **Staff gallery empty?** `auto_setup.py` clusters the crop embeddings
-   (ResNet50 + DBSCAN), picks the largest visually-coherent cluster as the
-   staff uniform group, and writes its 10 most-central crops as the gallery.
-   **No manual labels — staff are identified from the footage itself.**
-5. `cluster_and_label.py` re-classifies every track against the gallery,
-   merges cross-camera identities, and writes the canonical merged stream.
+4. **Staff gallery empty?** `auto_setup.py` clusters the crop appearance
+   signatures (default: **torso colour histogram**; deep backends opt-in via
+   `REID_BACKEND`), takes the largest coherent cluster (the dark-uniform group)
+   as staff, and writes its 10 most-central crops as the gallery. **No manual
+   labels — staff are identified from the footage itself.**
+5. `cluster_and_label.py` classifies staff/customer against the gallery, then
+   `identity.py` resolves people by **constrained spatiotemporal clustering on the
+   colour signature** (same-camera cannot-link + tracklet stitching + camera
+   topology). The unique count **emerges — no `K`, no prior**: on ST1008 the two
+   customers (grey shirt + tan safari bag) resolve as `unique_visitors = 2`, and
+   the dark uniforms group as staff. Two *identically-dressed* shoppers are split
+   by the same-camera **cannot-link** (concurrent = different people), not colour;
+   a deep embedding can be fused (`REID_BACKEND=fused`) for diverse data. **Re-entry**
+   (leave + return) reuses the same `visitor_id`. (Colour can't separate identical
+   *staff* uniforms, so `staff_count` is a uniform-group count — `docs/CHOICES.md` §4.)
 6. (Optional `SHIFT=1`) shift timestamps to today.
 7. `correlate.py` loads POS rows and emits abandon events.
 8. `replay.py` POSTs the final stream into `/events/ingest`.
@@ -95,9 +104,9 @@ python -m pipeline.replay data/sample_events.jsonl  # the dataset sample
 ```
 
 Per-camera output lands in `events/<store>_<camera>.jsonl`. The post-passes
-(`pipeline/tracker.py` for cross-camera dedupe + Re-ID, `pipeline/correlate.py`
-for POS correlation) merge into `events/final.jsonl`, which is the JSON that
-gets replayed into the API.
+(`pipeline/cluster_and_label.py` for cross-camera identity merge + re-ID,
+`pipeline/correlate.py` for POS correlation) merge into `events/<store>_final.jsonl`,
+which is the JSON that gets replayed into the API.
 
 ## Sanity check
 
@@ -122,7 +131,7 @@ idempotent — gallery and track-crop work is cached).
 docker compose exec api pytest --cov=app --cov-report=term -q
 ```
 
-49 tests, 78%+ statement coverage. The suite covers idempotency
+67 tests, broad edge-case coverage. The suite covers idempotency
 (within-batch and across-calls), per-event partial-success on validation
 errors, oversized batches, empty-store and all-staff filtering, zero-purchase
 conversion handling, the POS-correlation 5-minute window boundary,
@@ -145,8 +154,9 @@ All tunables are environment variables (see `app/config.py`):
 | `POS_CORRELATION_WINDOW_SECONDS` | `1800` | Window for `potential_conversion_rate` (loose, brand-aware) |
 | `POS_STRICT_WINDOW_SECONDS` | `300` | Window for funnel PURCHASE + abandon detection (brief's definition) |
 | `STAFF_GALLERY_DIR` | `/data/staff_gallery` | Where auto-built gallery lives |
-| `STAFF_DISTANCE_THRESHOLD` | `0.30` | Cosine distance for staff classification |
-| `NUM_STAFF` / `NUM_CUSTOMERS` | `0` (auto-K) | Identity-merge K hint; `0` = let DBSCAN decide |
+| `REID_BACKEND` | `color` | Appearance signature: `color` (default, torso HSV), `resnet50`, `osnet`, or `auto` |
+| `REID_WEIGHTS` | `/opt/models/osnet_x1_0_msmt17.pth` | OSNet weights (baked); used only when `REID_BACKEND=osnet/auto` |
+| `SAME_CAM_DIST` / `CROSS_CAM_DIST` | `0.45` | Identity-resolver colour-matching thresholds (re-ID params, not a count) |
 
 ## Docs
 

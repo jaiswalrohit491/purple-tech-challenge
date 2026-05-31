@@ -19,6 +19,7 @@ dependencies = [
 [project.optional-dependencies]
 pipeline = [
     "ultralytics>=8.3",
+    "lap>=0.5.12",          # ByteTrack association solver (else Ultralytics auto-installs at runtime)
     "opencv-python-headless>=4.10",
     "shapely>=2.0",
     "numpy>=1.26",
