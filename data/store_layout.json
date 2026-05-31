@@ -1,0 +1,77 @@
+{
+  "_note": "Zones derived from `Brigade Road - Store layout.xlsx` (the floor plan). CAM_01 covers the top skincare wall (8 brand sections); CAM_02 covers the bottom makeup wall (8 brand sections); CAM_05 covers the cash counter area. Polygons are floor regions immediately in front of each brand's shelving — customer bbox bottom-center on that floor area = a visit to that brand zone. Coordinates are in camera-frame pixels (1920x1080). Brand names match the POS CSV's `brand_name` column so /heatmap visits can be correlated with sales.",
+  "stores": [
+    {
+      "store_id": "ST1008",
+      "store_name": "Brigade_Bangalore",
+      "city": "Bangalore",
+      "open_hours": {"start": "10:00", "end": "22:00", "tz": "Asia/Kolkata"},
+      "clip_start_utc": "2026-04-10T14:39:30Z",
+      "_clip_start_local": "2026-04-10T20:09:30+05:30 (IST). Per POS data: 4 transactions in the 20h hour, all at 20:25:04 — 14 minutes outside the 5-minute correlation window, so conversion=0% for this 2-min clip is correct.",
+      "cameras": [
+        {
+          "camera_id": "CAM_01",
+          "view": "FLOOR",
+          "clip_path": "footage/CAM 1.mp4",
+          "_role": "Skincare wall — 8 brand sections across the top of the floor plan",
+          "_zone_layout": "Horizontal strips, each 240px wide, on the floor region (y=400-1080) in front of the shelves. Brands ordered left-to-right matching the floor plan.",
+          "zones": [
+            {"zone_id": "EB_KOREAN",     "brand_name": "EB Korean",      "polygon": [[   0, 400], [ 240, 400], [ 240, 1080], [   0, 1080]]},
+            {"zone_id": "THE_FACE_SHOP", "brand_name": "The Face Shop",  "polygon": [[ 240, 400], [ 480, 400], [ 480, 1080], [ 240, 1080]]},
+            {"zone_id": "GOOD_VIBES",    "brand_name": "Good Vibes",     "polygon": [[ 480, 400], [ 720, 400], [ 720, 1080], [ 480, 1080]]},
+            {"zone_id": "DERMDOC",       "brand_name": "DERMDOC",        "polygon": [[ 720, 400], [ 960, 400], [ 960, 1080], [ 720, 1080]]},
+            {"zone_id": "MINIMALIST",    "brand_name": "Minimalist",     "polygon": [[ 960, 400], [1200, 400], [1200, 1080], [ 960, 1080]]},
+            {"zone_id": "AQUALOGICA",    "brand_name": "Aqualogica",     "polygon": [[1200, 400], [1440, 400], [1440, 1080], [1200, 1080]]},
+            {"zone_id": "LAKME_SKIN",    "brand_name": "Lakme Skin",     "polygon": [[1440, 400], [1680, 400], [1680, 1080], [1440, 1080]]},
+            {"zone_id": "ACCESSORIES_SK","brand_name": "Accessories",    "polygon": [[1680, 400], [1920, 400], [1920, 1080], [1680, 1080]]}
+          ]
+        },
+        {
+          "camera_id": "CAM_02",
+          "view": "FLOOR",
+          "clip_path": "footage/CAM 2.mp4",
+          "_role": "Makeup wall — 8 brand sections across the bottom of the floor plan",
+          "zones": [
+            {"zone_id": "MAYBELLINE",    "brand_name": "Maybelline",     "polygon": [[   0, 400], [ 240, 400], [ 240, 1080], [   0, 1080]]},
+            {"zone_id": "FACES_CANADA",  "brand_name": "Faces Canada",   "polygon": [[ 240, 400], [ 480, 400], [ 480, 1080], [ 240, 1080]]},
+            {"zone_id": "LAKME",         "brand_name": "Lakme",          "polygon": [[ 480, 400], [ 720, 400], [ 720, 1080], [ 480, 1080]]},
+            {"zone_id": "COLORBAR_SUGAR","brand_name": "Colorbar+Sugar", "polygon": [[ 720, 400], [ 960, 400], [ 960, 1080], [ 720, 1080]]},
+            {"zone_id": "SWISS_BEAUTY",  "brand_name": "Swiss Beauty",   "polygon": [[ 960, 400], [1200, 400], [1200, 1080], [ 960, 1080]]},
+            {"zone_id": "NY_BAE",        "brand_name": "NY Bae",         "polygon": [[1200, 400], [1440, 400], [1440, 1080], [1200, 1080]]},
+            {"zone_id": "ALPS_GOODNESS", "brand_name": "Alps Goodness",  "polygon": [[1440, 400], [1680, 400], [1680, 1080], [1440, 1080]]},
+            {"zone_id": "STREAX",        "brand_name": "Streax",         "polygon": [[1680, 400], [1920, 400], [1920, 1080], [1680, 1080]]}
+          ]
+        },
+        {
+          "camera_id": "CAM_03",
+          "view": "ENTRY",
+          "clip_path": "footage/CAM 3.mp4",
+          "_role": "Entry/exit gate. Line at the actual door (x=1100). Nobody enters or exits in this 2-min clip — the 2 customers were already inside when recording began. Crossings the line crosser does produce here are street foot-traffic; they're filtered out at the cross-camera merge step (cluster_and_label only uses CAM_01/02/05).",
+          "entry_line": [[1100, 50], [1100, 1050]],
+          "entry_normal_inward": [-1, 0],
+          "zones": []
+        },
+        {
+          "camera_id": "CAM_04",
+          "view": "BACK_OFFICE",
+          "clip_path": "footage/CAM 4.mp4",
+          "_role": "Warehouse — staff-only by physical access. force_staff overrides appearance classifier.",
+          "force_staff": true,
+          "zones": [
+            {"zone_id": "BACK_OFFICE", "polygon": [[50, 50], [1870, 50], [1870, 1030], [50, 1030]]}
+          ]
+        },
+        {
+          "camera_id": "CAM_05",
+          "view": "BILLING",
+          "clip_path": "footage/CAM 5.mp4",
+          "_role": "Cash counter area. BILLING_QUEUE = floor region where customers stand to pay. CASH_COUNTER = behind-counter region where staff operate the POS.",
+          "zones": [
+            {"zone_id": "BILLING_QUEUE", "polygon": [[ 300, 200], [1100, 200], [1100, 1050], [ 300, 1050]]},
+            {"zone_id": "CASH_COUNTER",  "polygon": [[1100, 200], [1920, 200], [1920, 1050], [1100, 1050]]}
+          ]
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,33 @@
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+.env
+.env.local
+.coverage
+.pytest_cache/
+.ruff_cache/
+htmlcov/
+*.egg-info/
+dist/
+build/
+
+# Dataset & runtime artifacts (never commit)
+data/*
+!data/store_layout.json
+!data/staff_gallery/
+!data/customer_gallery/
+events/
+*.mp4
+*.mov
+*.avi
+*.weights
+*.pt
+yolov8*.pt
+osnet_*.pth
+
+# Editor
+.vscode/
+.idea/
+.DS_Store

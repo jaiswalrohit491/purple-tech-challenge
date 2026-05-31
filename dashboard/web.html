@@ -1,0 +1,133 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>Apex Retail — Store Intelligence</title>
+<style>
+  :root { color-scheme: dark; }
+  body {
+    margin: 0; font-family: -apple-system, "SF Mono", "JetBrains Mono", Menlo, monospace;
+    background: #0d1117; color: #e6edf3; padding: 24px;
+  }
+  header { display: flex; justify-content: space-between; align-items: baseline;
+           margin-bottom: 20px; }
+  h1 { margin: 0; font-size: 18px; letter-spacing: 0.5px; }
+  .status { font-size: 12px; color: #8b949e; }
+  .grid { display: grid; gap: 14px;
+          grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); }
+  .card { background: #161b22; border: 1px solid #30363d; border-radius: 8px;
+          padding: 14px 16px; }
+  .card h2 { margin: 0 0 8px 0; font-size: 13px; color: #e6edf3; }
+  .row { display: flex; justify-content: space-between; font-size: 13px; padding: 3px 0; }
+  .row .k { color: #8b949e; }
+  .row .v { color: #e6edf3; font-weight: 600; font-variant-numeric: tabular-nums; }
+  .row .v.warn { color: #d29922; }
+  .row .v.crit { color: #f85149; }
+  .row .v.ok { color: #3fb950; }
+  .footer { margin-top: 22px; font-size: 12px; color: #6e7681; }
+  .anomalies { margin-top: 24px; }
+  .anomalies h3 { margin: 0 0 8px 0; font-size: 13px; color: #8b949e; }
+  .anomaly { display: flex; gap: 10px; font-size: 12px;
+             padding: 4px 0; border-bottom: 1px dashed #21262d; }
+  .sev { width: 64px; }
+  .sev.INFO { color: #58a6ff; }
+  .sev.WARN { color: #d29922; }
+  .sev.CRITICAL { color: #f85149; }
+  .empty { color: #6e7681; font-style: italic; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Apex Retail — Store Intelligence</h1>
+  <div class="status" id="status">connecting…</div>
+</header>
+<div class="grid" id="grid"></div>
+<div class="anomalies">
+  <h3>Active anomalies</h3>
+  <div id="anomalies"></div>
+</div>
+<div class="footer">Polling /health, /metrics, /anomalies every 2s · stop the server to close.</div>
+<script>
+  const BASE = "";  // same origin — served by FastAPI at /dashboard
+  const grid = document.getElementById("grid");
+  const anomEl = document.getElementById("anomalies");
+  const statusEl = document.getElementById("status");
+
+  function fmtPct(x) { return ((x || 0) * 100).toFixed(1); }
+  function fmtNum(x) { return (x || 0).toLocaleString(); }
+  // Escape any server-supplied string before interpolating into innerHTML.
+  // Server-supplied fields (store_id, anomaly_type, suggested_action, ...)
+  // travel through /events/ingest, which only enforces length/regex on a
+  // subset of fields — never trust them for HTML interpolation.
+  function esc(s) {
+    return String(s == null ? "" : s)
+      .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+  }
+
+  async function tick() {
+    try {
+      const health = await fetch(BASE + "/health").then(r => r.json());
+      const stores = health.stores || [];
+      statusEl.textContent =
+        `status=${health.status}  db=${health.db_reachable}  ` +
+        `stores=${stores.length}  ts=${new Date().toLocaleTimeString()}`;
+
+      if (!stores.length) {
+        grid.innerHTML = '<div class="empty">No stores have ingested events yet.</div>';
+        anomEl.innerHTML = '';
+        return;
+      }
+
+      const results = await Promise.all(stores.map(async f => {
+        const [metrics, anomalies] = await Promise.all([
+          fetch(`${BASE}/stores/${f.store_id}/metrics`).then(r => r.json()),
+          fetch(`${BASE}/stores/${f.store_id}/anomalies`).then(r => r.json()),
+        ]);
+        return { feed: f, metrics, anomalies: anomalies.anomalies || [] };
+      }));
+
+      grid.innerHTML = results.map(({ feed, metrics }) => {
+        const q = metrics.current_queue_depth || 0;
+        const qCls = q >= 8 ? "crit" : q >= 5 ? "warn" : "ok";
+        const staleCls = feed.stale ? "crit" : "ok";
+        return `
+          <div class="card">
+            <h2>${esc(feed.store_id)}</h2>
+            <div class="row"><span class="k">Visitors</span>
+                             <span class="v">${fmtNum(metrics.unique_visitors)}</span></div>
+            <div class="row"><span class="k">Conversion</span>
+                             <span class="v">${fmtPct(metrics.conversion_rate)}%</span></div>
+            <div class="row"><span class="k">Queue depth</span>
+                             <span class="v ${qCls}">${q}</span></div>
+            <div class="row"><span class="k">Abandonment</span>
+                             <span class="v">${fmtPct(metrics.abandonment_rate)}%</span></div>
+            <div class="row"><span class="k">Feed</span>
+                             <span class="v ${staleCls}">${feed.stale ? "STALE" : "OK"}</span></div>
+          </div>`;
+      }).join("");
+
+      const allAnoms = results.flatMap(r =>
+        r.anomalies.map(a => ({ ...a, store_id: r.feed.store_id }))
+      );
+      if (!allAnoms.length) {
+        anomEl.innerHTML = '<div class="empty">No active anomalies.</div>';
+      } else {
+        // Severity is restricted to INFO|WARN|CRITICAL by the API; still
+        // escape for defense-in-depth against future schema changes.
+        anomEl.innerHTML = allAnoms.slice(0, 10).map(a => `
+          <div class="anomaly">
+            <span class="sev ${esc(a.severity)}">${esc(a.severity)}</span>
+            <span><strong>${esc(a.store_id)}</strong> ${esc(a.anomaly_type)}</span>
+            <span style="flex:1; color:#8b949e">${esc(a.suggested_action || "")}</span>
+          </div>`).join("");
+      }
+    } catch (e) {
+      statusEl.textContent = "error: " + e.message;
+    }
+  }
+  tick();
+  setInterval(tick, 2000);
+</script>
+</body>
+</html>
