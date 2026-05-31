@@ -18,7 +18,12 @@ from __future__ import annotations
 
 import numpy as np
 
-from pipeline.identity import build_topology, peak_occupancy, resolve
+from pipeline.identity import (
+    build_topology,
+    choose_count_source,
+    peak_occupancy,
+    resolve,
+)
 
 SAME = np.array([1.0, 0.0, 0.0])      # identical appearance
 OTHER = np.array([0.0, 1.0, 0.0])     # orthogonal -> cosine distance 1.0
@@ -116,3 +121,14 @@ def test_resolve_empty_input():
     labels, stats = resolve([], [], np.empty((0, 3)))
     assert stats["n_identities"] == 0
     assert len(labels) == 0
+
+
+def test_count_source_prefers_entry_gate():
+    """Entry-gate footfall is authoritative whenever it has data; appearance is
+    used only as a fallback when the gate feed is insufficient."""
+    assert choose_count_source(gate_entries=5) == "entry_gate"
+    assert choose_count_source(gate_entries=1) == "entry_gate"
+    assert choose_count_source(gate_entries=0) == "appearance"          # this clip
+    # threshold is configurable, but the gate always wins once it's met
+    assert choose_count_source(gate_entries=2, min_gate_entries=3) == "appearance"
+    assert choose_count_source(gate_entries=3, min_gate_entries=3) == "entry_gate"

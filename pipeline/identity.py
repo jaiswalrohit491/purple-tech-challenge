@@ -158,6 +158,18 @@ def peak_occupancy(spans: list[tuple[float, float]], cameras: list[str]) -> int:
     return peak
 
 
+def choose_count_source(gate_entries: int, min_gate_entries: int = 1) -> str:
+    """Pick the authoritative source for the unique-visitor count.
+
+    Entry-gate line-crossings (footfall) are the canonical, higher-confidence
+    signal and ALWAYS take priority when the gate feed has data. Appearance-based
+    identity resolution is the *fallback*, used only when the gate is
+    insufficient — e.g. a mid-session clip where customers were already inside
+    and no entries were captured. Returns "entry_gate" or "appearance".
+    """
+    return "entry_gate" if gate_entries >= max(1, min_gate_entries) else "appearance"
+
+
 def build_topology(cameras: list[str], layout_topology: dict | None) -> dict[str, set[str]] | None:
     """Build a reachability map. If the layout declares `camera_topology`
     (`{cam: [reachable cams]}`), use it; else fully-connect the given cameras

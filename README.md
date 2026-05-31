@@ -31,7 +31,10 @@ Drop it in production where events arrive in real-time.
    as staff, and writes its 10 most-central crops as the gallery. **No manual
    labels — staff are identified from the footage itself.**
 5. `cluster_and_label.py` classifies staff/customer against the gallery, then
-   `identity.py` resolves people by **constrained spatiotemporal clustering on the
+   the unique count is taken from the **entry-gate** line-crossings first
+   (authoritative footfall, auto-detected from the layout); when the gate has no
+   entries (this clip), `identity.py` is the **fallback** — **constrained
+   spatiotemporal clustering on the
    colour signature** (same-camera cannot-link + tracklet stitching + camera
    topology). The unique count **emerges — no `K`, no prior**: on ST1008 the two
    customers (grey shirt + tan safari bag) resolve as `unique_visitors = 2`, and

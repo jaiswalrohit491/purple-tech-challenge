@@ -7,9 +7,12 @@ The store under test is **ST1008 (Brigade_Bangalore)** — a Purplle cosmetics
 retail outlet with 5 cameras (CAM_01 skincare floor, CAM_02 makeup floor,
 CAM_03 entry/exit gate, CAM_04 back-office, CAM_05 billing counter). The clip
 provided is ~2 minutes of footage from 2026-04-10 around 20:09 IST. The
-operator's ground truth is **2 customers and 5 staff**. The pipeline measures
-**unique_visitors = 2** from appearance (below); staff are detected as a uniform
-group rather than counted individually.
+operator's ground truth is **2 customers and 5 staff**. Unique visitors are
+counted at the **entry gate** first (authoritative footfall); appearance is only
+the *fallback* when the gate feed is insufficient. This clip captures **zero**
+gate entries (customers were already inside), so the system falls back to
+appearance and measures **unique_visitors = 2** (§3.2b). Staff are detected as a
+uniform group, not counted individually.
 
 **How the count is obtained — measured by clothing colour, no prior.** The unique
 customer count is *resolved*, not supplied. The discriminative signal is the one a
@@ -115,6 +118,20 @@ the line and the YOLO bbox center jitters by 5-10 pixels frame to frame.
 track's **stable side** flips — and a side is only "stable" when the track
 centroid is at least `hysteresis_px=50` from the line. Jitter inside the
 ±50px deadband is ignored.
+
+### 3.2b Visitor count — entry gate first, appearance as fallback
+
+Footfall through the entrance line (CAM_03) is the **authoritative** unique-visitor
+signal and always takes priority: it's the canonical retail method, direction-
+filtered and hysteresis-debounced. The appearance-based identity engine (colour +
+spatiotemporal, §3.4) is the **fallback**, used to count only when the gate feed is
+insufficient. `pipeline/identity.choose_count_source` makes the call; `run.sh`
+auto-detects the entrance camera from the layout (`view==ENTRY`).
+
+On *this* clip the gate captures **zero** real entries (customers were already
+inside — §3.3), so the system falls back to appearance and reports `unique_visitors
+= 2`. On normal footage with people walking in, the gate count dominates and the
+appearance engine is not needed for counting.
 
 ### 3.3 Limitation specific to this clip
 

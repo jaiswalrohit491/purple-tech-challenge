@@ -132,6 +132,14 @@ business metric: unique *customers* is measured correctly.
 
 ## 4. Defining uniqueness — torso colour, measured count (no prior)
 
+**Count-source priority (entry gate > appearance).** The unique-visitor count is
+taken from **entry-gate line-crossings** (CAM with `view==ENTRY`) whenever the gate
+has entries — it's the canonical, higher-confidence footfall signal and always
+wins. The appearance engine below is the **fallback**, used to count only when the
+gate feed is insufficient (this clip: 0 entries, customers already inside). See
+`identity.choose_count_source` and DESIGN.md §3.2b. The rest of this section is the
+fallback's design.
+
 **The question that fixed this:** *how are we even defining uniqueness?* The
 earlier pipeline defined a person as a cluster of tracks whose **deep whole-body
 embedding** matched. That is the wrong signature: ResNet/OSNet embeddings are

@@ -141,6 +141,13 @@ def main() -> int:
                    help="If a resolved customer is absent from all cameras longer "
                         "than this many seconds and returns, emit a REENTRY event "
                         "(same visitor_id, no double-count).")
+    p.add_argument("--entry-camera", default=None,
+                   help="Entrance camera id (line-crossing footfall). The unique "
+                        "count comes from here when it has entries; appearance is "
+                        "the fallback. Default: auto-detect from layout (view=ENTRY).")
+    p.add_argument("--min-gate-entries", type=int, default=1,
+                   help="Min entry-gate crossings to treat the gate as the "
+                        "authoritative count source (else fall back to appearance).")
     p.add_argument("--out", type=Path, required=True)
     p.add_argument("--store-id", default="STORE_001")
     p.add_argument("--min-crop-aspect", type=float, default=1.3,
@@ -259,6 +266,13 @@ def main() -> int:
             for s in stores:
                 if s.get("store_id") == args.store_id or len(stores) == 1:
                     layout_topo = s.get("camera_topology")
+                    # Auto-detect the entrance camera (view==ENTRY / has entry_line)
+                    # unless one was passed explicitly.
+                    if not args.entry_camera:
+                        for c in s.get("cameras", []):
+                            if c.get("view") == "ENTRY" or c.get("entry_line"):
+                                args.entry_camera = c["camera_id"]
+                                break
                     break
         except Exception:
             layout_topo = None
@@ -323,36 +337,83 @@ def main() -> int:
                 e["metadata"] = meta
                 out_events.append(e)
 
-    # Synthesise one ENTRY event per RESOLVED customer identity at their earliest
-    # appearance, so /metrics.unique_visitors (which filters event_type in
-    # ENTRY/REENTRY) returns the measured customer count without a SQL change.
-    # The count is whatever the spatiotemporal resolver found — not a prior.
+    import uuid as _uuid
+    from . import identity as _idmod
+
+    # ---- Visitor count: ENTRY GATE is authoritative; appearance is fallback ----
+    # Footfall through the entrance line (CAM with view==ENTRY / an entry_line) is
+    # the canonical, higher-confidence count and ALWAYS wins when it has data.
+    # Appearance-resolved identities are used to count ONLY when the gate feed is
+    # insufficient (e.g. this clip: customers already inside, zero entries
+    # captured). See identity.choose_count_source.
     earliest: dict[str, dict] = {}
     for e in out_events:
         canon = e["visitor_id"]
         if canon not in earliest or e["timestamp"] < earliest[canon]["timestamp"]:
             earliest[canon] = e
-    import uuid as _uuid
+
+    # Gate entries: customer inward ENTRY crossings on the entry camera, one per
+    # gate track (re-crossings handled as re-entry downstream).
+    gate_entries: list[dict] = []
+    if args.entry_camera:
+        gef = args.events_dir / f"{args.store_id}_{args.entry_camera}.jsonl"
+        if gef.exists():
+            seen_track: dict[str, str] = {}
+            for line in gef.read_text().splitlines():
+                if not line.strip():
+                    continue
+                ge = json.loads(line)
+                if ge.get("event_type") != "ENTRY" or ge.get("is_staff"):
+                    continue
+                tk = ge["visitor_id"]
+                if tk not in seen_track or ge["timestamp"] < seen_track[tk]:
+                    seen_track[tk] = ge["timestamp"]
+            gate_entries = [{"track": tk, "timestamp": ts} for tk, ts in seen_track.items()]
+            gate_entries.sort(key=lambda g: g["timestamp"])
+
+    count_source = _idmod.choose_count_source(len(gate_entries), args.min_gate_entries)
+
     entry_events = []
-    for canon, e in earliest.items():
-        if e.get("is_staff"):  # entries are only synthesised for customers
-            continue
-        entry_events.append({
-            "event_id": str(_uuid.uuid4()),
-            "store_id": e["store_id"],
-            "camera_id": e["camera_id"],
-            "visitor_id": canon,
-            "event_type": "ENTRY",
-            "timestamp": e["timestamp"],
-            "zone_id": None,
-            "dwell_ms": 0,
-            "is_staff": False,
-            "confidence": 0.9,
-            "metadata": {
-                "queue_depth": None, "sku_zone": None, "session_seq": 0,
-                "synthetic": True, "reason": "first appearance after track merging",
-            },
-        })
+    if count_source == "entry_gate":
+        # Authoritative footfall: one ENTRY per gate crossing. Link each crossing
+        # to the in-store appearance identity that first appears AFTER it (so the
+        # funnel still chains entry→zones→billing); unmatched crossings are real
+        # visitors who simply weren't re-identified in-store.
+        instore = sorted(
+            ((e["timestamp"], canon) for canon, e in earliest.items() if not e.get("is_staff")),
+        )
+        used: set[str] = set()
+        for n, g in enumerate(gate_entries, 1):
+            vid = None
+            for ts, canon in instore:
+                if canon not in used and ts >= g["timestamp"]:
+                    vid, _ = canon, used.add(canon)
+                    break
+            vid = vid or f"VISITOR_{n:02d}"
+            ev0 = earliest.get(vid, next(iter(earliest.values())))
+            entry_events.append({
+                "event_id": str(_uuid.uuid4()), "store_id": ev0["store_id"],
+                "camera_id": args.entry_camera, "visitor_id": vid, "event_type": "ENTRY",
+                "timestamp": g["timestamp"], "zone_id": None, "dwell_ms": 0,
+                "is_staff": False, "confidence": 0.9,
+                "metadata": {"queue_depth": None, "sku_zone": None, "session_seq": 0,
+                             "synthetic": True, "source": "entry_gate",
+                             "gate_track": g["track"]},
+            })
+    else:
+        # Fallback: appearance-resolved identities (gate feed insufficient).
+        for canon, e in earliest.items():
+            if e.get("is_staff"):
+                continue
+            entry_events.append({
+                "event_id": str(_uuid.uuid4()), "store_id": e["store_id"],
+                "camera_id": e["camera_id"], "visitor_id": canon, "event_type": "ENTRY",
+                "timestamp": e["timestamp"], "zone_id": None, "dwell_ms": 0,
+                "is_staff": False, "confidence": 0.9,
+                "metadata": {"queue_depth": None, "sku_zone": None, "session_seq": 0,
+                             "synthetic": True, "source": "appearance_fallback",
+                             "reason": "entry gate had no usable entries"},
+            })
     out_events.extend(entry_events)
 
     # Re-entry: a resolved customer who disappears from all cameras for longer
@@ -360,7 +421,6 @@ def main() -> int:
     # of return, REUSING the same visitor_id (so the funnel / unique_visitors do
     # not double-count — REENTRY and ENTRY both map to one person). This is the
     # measured analogue of "left the floor and came back".
-    from . import identity as _idmod
     reentry_events = []
     by_canon: dict[str, list[dict]] = defaultdict(list)
     for e in out_events:
@@ -409,6 +469,9 @@ def main() -> int:
         "events_out": len(out_events),
         "synthetic_entries": len(entry_events),
         "reentry_events": len(reentry_events),
+        "visitor_count_source": count_source,
+        "gate_entries": len(gate_entries),
+        "entry_camera": args.entry_camera,
         "n_customers": len(customers),
         "n_staff": len(staff),
         "peak_customer_occupancy": cust_occ,
