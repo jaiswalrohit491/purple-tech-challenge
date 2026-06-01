@@ -3,21 +3,68 @@
 End-to-end pipeline that turns raw CCTV footage into a live offline-store
 analytics API. Detection → structured events → REST API → live dashboard.
 
-## Quick start (5 commands)
+## Instructions to Run
+
+**Prerequisites:** Docker + Docker Compose (Docker Desktop on Mac/Windows).
+Nothing else is required for the fast path — the API image bundles everything.
 
 ```bash
 git clone <repo-url> store-intelligence && cd store-intelligence
-docker compose up -d --build               # starts Postgres + API
-SHIFT=1 ./pipeline/run.sh                  # auto-bootstrap (see below) + replay
+docker compose up -d --build               # starts Postgres + API on :8000
+```
+
+Wait ~10s for the API to report healthy:
+
+```bash
+curl -s localhost:8000/health             # → {"status":"ok", ...}
+```
+
+### Path A — fastest (Docker only, no Python/ML install)
+
+Replay the **pre-computed** ST1008 event stream that ships in the repo
+(`events/ST1008_final.jsonl`). It's mounted into the container, so this needs
+no host dependencies — just the running stack from above:
+
+```bash
+# shift the clip's old timestamps into today's window, then replay into the API
+docker compose exec api python -m pipeline.shift_to_now \
+    /events/ST1008_final.jsonl --out /events/ST1008_final.shifted.jsonl --regenerate-ids
+docker compose exec api python -m pipeline.replay \
+    --url http://localhost:8000 /events/ST1008_final.shifted.jsonl
+
 open http://localhost:8000/dashboard       # live web dashboard
 open http://localhost:8000/docs            # OpenAPI UI
 ```
 
-That's it. No manual schema migration, no manual labels, no extra services.
+The API's read endpoints filter to today's UTC window, so the `shift_to_now`
+step is what makes the historical clip show up in metrics/dashboard. Drop it in
+production where events arrive in real-time.
 
-The `SHIFT=1` flag rebases the clip's timestamps to "today" so the API's
-day-window queries (which look at `ts >= today_00:00 UTC`) see the events.
-Drop it in production where events arrive in real-time.
+### Path B — full pipeline from raw footage
+
+Regenerate everything from the CCTV clips in `data/footage/` (detection →
+identity resolution → POS correlation → replay). This runs on the **host** and
+needs the pipeline deps (OpenCV, Torch, Ultralytics):
+
+```bash
+pip install -e ".[pipeline]"               # once
+SHIFT=1 ./pipeline/run.sh                   # auto-bootstrap (see below) + replay
+open http://localhost:8000/dashboard
+```
+
+`run.sh` is idempotent (gallery + track-crop work is cached), auto-builds the
+store layout and staff gallery from the footage itself, and writes the final
+stream to `events/ST1008_final.jsonl` before replaying it.
+
+### Verify it worked
+
+```bash
+./verify_gate.sh                            # end-to-end acceptance gate → "GATE: OK"
+```
+
+See [Sanity check](#sanity-check) for what the gate does (it resets the DB), and
+[Tests](#tests) to run the 67-test suite. The rest of this README explains the
+internals.
 
 ## What `run.sh` actually does (auto-bootstrap)
 

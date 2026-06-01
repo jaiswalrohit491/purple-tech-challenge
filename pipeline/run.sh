@@ -40,7 +40,6 @@ if [ ! -f "$LAYOUT" ]; then
     step "no layout — auto-generating coarse default"
     python3 -m pipeline.auto_setup --layout "$LAYOUT" --footage "$DATA_DIR/footage" \
         --gallery "$STAFF_GALLERY_DIR" \
-        --crops-dirs "$EVENTS_DIR/track_crops/CAM_01" "$EVENTS_DIR/track_crops/CAM_02" "$EVENTS_DIR/track_crops/CAM_05" \
         --force 2>&1 | tail -5 || true
 fi
 
@@ -79,12 +78,33 @@ done
 STORE_ID=$(python3 -c "
 import json; print(json.load(open('$LAYOUT'))['stores'][0]['store_id'])")
 
+# Derive the in-store cameras from the layout — the ones customers shop/pay at
+# (view = FLOOR or BILLING). ENTRY (gate) and BACK_OFFICE (staff-only) cameras
+# are excluded from crop extraction + cross-camera identity. Works for both the
+# auto-generated layout and a hand-calibrated one; both set the `view` field.
+mapfile -t INSTORE_CAMS < <(python3 -c "
+import json
+d = json.load(open('$LAYOUT'))
+for s in (d.get('stores') or d):
+    for c in s.get('cameras', []):
+        if c.get('view') in ('FLOOR', 'BILLING') and c.get('clip_path'):
+            print(c['camera_id'])
+")
+if [ "${#INSTORE_CAMS[@]}" -eq 0 ]; then
+    echo "run.sh: no in-store (FLOOR/BILLING) cameras in layout" >&2; exit 1
+fi
+CROPS_DIRS=()
+for CAM in "${INSTORE_CAMS[@]}"; do
+    CROPS_DIRS+=("$EVENTS_DIR/track_crops/$CAM")
+done
+step "in-store cameras: ${INSTORE_CAMS[*]}"
+
 # Unique-person count is MEASURED by the spatiotemporal identity engine
 # (pipeline/identity.py) — no operator headcount prior, no K. Camera geometry
 # (`camera_topology`) is read from the layout to gate cross-camera links.
 
 # ---------- 3. extract crops for in-store cameras ----------
-for CAM in CAM_01 CAM_02 CAM_05; do
+for CAM in "${INSTORE_CAMS[@]}"; do
     CROPS_DIR="$EVENTS_DIR/track_crops/$CAM"
     if [ ! -d "$CROPS_DIR" ] || [ -z "$(ls -A "$CROPS_DIR" 2>/dev/null)" ]; then
         step "extracting track crops on $CAM"
@@ -99,7 +119,7 @@ if [ ! -d "$STAFF_GALLERY_DIR" ] || [ -z "$(ls "$STAFF_GALLERY_DIR"/*.jpg 2>/dev
     step "auto-discovering staff cluster → $STAFF_GALLERY_DIR"
     python3 -m pipeline.auto_setup --layout "$LAYOUT" --footage "$DATA_DIR/footage" \
         --gallery "$STAFF_GALLERY_DIR" \
-        --crops-dirs "$EVENTS_DIR/track_crops/CAM_01" "$EVENTS_DIR/track_crops/CAM_02" "$EVENTS_DIR/track_crops/CAM_05" \
+        --crops-dirs "${CROPS_DIRS[@]}" \
         --force 2>&1 | tail -10
 fi
 
@@ -107,8 +127,8 @@ fi
 step "cross-camera merge + classify"
 python3 -m pipeline.cluster_and_label \
     --events-dir "$EVENTS_DIR" \
-    --cameras CAM_01 CAM_02 CAM_05 \
-    --crops-dirs "$EVENTS_DIR/track_crops/CAM_01" "$EVENTS_DIR/track_crops/CAM_02" "$EVENTS_DIR/track_crops/CAM_05" \
+    --cameras "${INSTORE_CAMS[@]}" \
+    --crops-dirs "${CROPS_DIRS[@]}" \
     --staff-gallery "$STAFF_GALLERY_DIR" \
     --customer-gallery "$DATA_DIR/nonexistent_customer_gallery" \
     --layout "$LAYOUT" \
